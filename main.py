@@ -286,8 +286,12 @@ def monitor_weixin(user: UserConfig):
             )
 
             data = resp.json()
+            # 调试：打印响应（只在有内容时）
+            if data.get("msgs") or data.get("ret") != 0:
+                print(f"[DEBUG] getupdates响应: ret={data.get('ret')}, errcode={data.get('errcode')}, msgs_count={len(data.get('msgs', []))}")
 
             if data.get("ret") != 0 or data.get("errcode", 0) != 0:
+                print(f"[DEBUG] 监听异常: {data}")
                 time.sleep(2)
                 continue
 
@@ -374,6 +378,7 @@ def do_qr_login() -> Optional[UserConfig]:
                     break
                 elif status == "confirmed":
                     print(f"登录成功! BotID: {status_data.get('ilink_bot_id')}")
+                    print(f"[DEBUG] 登录返回数据: {json.dumps(status_data, indent=2, ensure_ascii=False)}")
 
                     # 创建用户配置
                     user = UserConfig({
@@ -382,6 +387,7 @@ def do_qr_login() -> Optional[UserConfig]:
                         "ilink_user_id": status_data.get("ilink_user_id", ""),
                         "api_token": generate_token(16),
                     })
+                    print(f"[DEBUG] 用户配置: bot_token={user.bot_token[:20]}..., ilink_user_id={user.ilink_user_id}")
 
                     # 保存配置
                     cfg.lock.acquire()
