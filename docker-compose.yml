@@ -1,0 +1,13 @@
+name: weclawbot-api-py
+services:
+  weclawbot-api-py:
+    build: .
+    image: weclawbot-api-py:latest
+    container_name: weclawbot-api-py
+    ports:
+      - "26322:26322"
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
