@@ -116,7 +116,7 @@ def common_headers(token: str = "") -> dict:
 
 
 def send_message(user: UserConfig, to: str, text: str, context_token: str) -> bool:
-    """发送消息"""
+    """发送文本消息"""
     req_data = {
         "msg": {
             "from_user_id": "",
@@ -149,6 +149,81 @@ def send_message(user: UserConfig, to: str, text: str, context_token: str) -> bo
         return False
     except Exception as e:
         print(f"发送消息异常: {e}")
+        return False
+
+
+def upload_image(user: UserConfig, image_data: bytes, filename: str = "image.jpg") -> Optional[str]:
+    """
+    上传图片到微信服务器
+    返回 image_url 或 None
+    """
+    try:
+        # 构建multipart/form-data请求
+        files = {
+            "file": (filename, image_data, "image/jpeg")
+        }
+        
+        resp = requests.post(
+            f"{DEFAULT_BASE_URL}/ilink/bot/uploadimage",
+            files=files,
+            headers={
+                "AuthorizationType": "ilink_bot_token",
+                "X-WECHAT-UIN": random_wechat_uin(),
+                "Authorization": f"Bearer {user.bot_token}",
+            },
+            timeout=30
+        )
+        
+        data = resp.json()
+        if data.get("ret") == 0:
+            # 返回图片URL
+            return data.get("image_url") or data.get("url") or data.get("media_id")
+        print(f"上传图片失败: {data}")
+        return None
+    except Exception as e:
+        print(f"上传图片异常: {e}")
+        return None
+
+
+def send_image(user: UserConfig, to: str, image_url: str, context_token: str) -> bool:
+    """
+    发送图片消息
+    image_url: 图片URL或base64数据
+    """
+    req_data = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to,
+            "client_id": f"openclaw-weixin:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token,
+            "item_list": [
+                {
+                    "type": 3,  # 图片类型
+                    "image_item": {
+                        "image_url": image_url
+                    }
+                }
+            ]
+        },
+        "base_info": {"channel_version": "1.0.2"}
+    }
+
+    try:
+        resp = requests.post(
+            f"{DEFAULT_BASE_URL}/ilink/bot/sendmessage",
+            json=req_data,
+            headers=common_headers(user.bot_token),
+            timeout=10
+        )
+        data = resp.json()
+        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
+            return True
+        print(f"发送图片失败: {data}")
+        return False
+    except Exception as e:
+        print(f"发送图片异常: {e}")
         return False
 
 
@@ -430,6 +505,55 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"code": 200, "message": "OK"})
             else:
                 self.send_json(500, {"code": 500, "error": "Send failed"})
+
+        elif action == "images":
+            # 发送图片消息
+            image_url = self.get_param("image_url")
+            image_base64 = self.get_param("image_base64")
+            
+            if not image_url and not image_base64:
+                self.send_json(400, {"code": 400, "error": "Missing image_url or image_base64"})
+                return
+
+            if not user.ilink_user_id or not user.context_token:
+                self.send_json(400, {"code": 400, "error": "Context not ready"})
+                return
+
+            # 如果传的是base64，先上传
+            if image_base64 and not image_url:
+                try:
+                    import base64 as b64
+                    image_data = b64.b64decode(image_base64)
+                    image_url = upload_image(user, image_data)
+                    if not image_url:
+                        self.send_json(500, {"code": 500, "error": "Image upload failed"})
+                        return
+                except Exception as e:
+                    self.send_json(400, {"code": 400, "error": f"Invalid base64: {e}"})
+                    return
+
+            if send_image(user, user.ilink_user_id, image_url, user.context_token):
+                self.send_json(200, {"code": 200, "message": "OK", "image_url": image_url})
+            else:
+                self.send_json(500, {"code": 500, "error": "Send image failed"})
+
+        elif action == "upload":
+            # 仅上传图片，返回URL
+            image_base64 = self.get_param("image_base64")
+            if not image_base64:
+                self.send_json(400, {"code": 400, "error": "Missing image_base64"})
+                return
+
+            try:
+                import base64 as b64
+                image_data = b64.b64decode(image_base64)
+                image_url = upload_image(user, image_data)
+                if image_url:
+                    self.send_json(200, {"code": 200, "image_url": image_url})
+                else:
+                    self.send_json(500, {"code": 500, "error": "Upload failed"})
+            except Exception as e:
+                self.send_json(400, {"code": 400, "error": f"Invalid base64: {e}"})
 
         elif action == "typing":
             status_str = self.get_param("status")

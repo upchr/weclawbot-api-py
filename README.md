@@ -44,7 +44,7 @@ python main.py
 
 ## API 文档
 
-### 发送消息
+### 发送文本消息
 
 ```bash
 # GET
@@ -55,6 +55,40 @@ curl -X POST "http://localhost:26322/bots/{bot_id}/messages" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer {api_token}" \
   -d '{"text": "Hello"}'
+```
+
+### 发送图片消息
+
+**方式一：提供图片URL**
+
+```bash
+curl -X POST "http://localhost:26322/bots/{bot_id}/images" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {api_token}" \
+  -d '{"image_url": "https://example.com/image.jpg"}'
+```
+
+**方式二：Base64编码图片**
+
+```bash
+# 将图片转为base64并发送
+IMAGE_BASE64=$(base64 -w 0 image.jpg)
+curl -X POST "http://localhost:26322/bots/{bot_id}/images" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {api_token}" \
+  -d "{\"image_base64\": \"$IMAGE_BASE64\"}"
+```
+
+### 仅上传图片（返回URL）
+
+```bash
+IMAGE_BASE64=$(base64 -w 0 image.jpg)
+curl -X POST "http://localhost:26322/bots/{bot_id}/upload" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {api_token}" \
+  -d "{\"image_base64\": \"$IMAGE_BASE64\"}"
+
+# 响应: {"code": 200, "image_url": "..."}
 ```
 
 ### 发送输入状态
