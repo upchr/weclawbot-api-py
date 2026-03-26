@@ -612,16 +612,26 @@ def monitor_weixin(user: UserConfig):
                 cfg.save()
 
             # 处理消息
-            for msg in data.get("msgs", []):
+            msgs = data.get("msgs", [])
+            if msgs:
+                print(f"[Bot: {user.bot_id}] 收到 {len(msgs)} 条消息")
+            
+            for msg in msgs:
                 from_user = msg.get("from_user_id", "")
+                context_token = msg.get("context_token", "")
+                
+                print(f"[DEBUG] from_user={from_user}, context_token={context_token[:20] if context_token else 'None'}...")
+                
                 if from_user:
-                    # 更新 context
-                    if msg.get("context_token"):
-                        cfg.lock.acquire()
-                        user.context_token = msg["context_token"]
-                        user.ilink_user_id = from_user
-                        cfg.lock.release()
-                        cfg.save()
+                    # 始终更新 ilink_user_id
+                    cfg.lock.acquire()
+                    user.ilink_user_id = from_user
+                    # 只有当 context_token 存在时才更新
+                    if context_token:
+                        user.context_token = context_token
+                        print(f"[Bot: {user.bot_id}] 上下文已更新: ilink_user_id={from_user}")
+                    cfg.lock.release()
+                    cfg.save()
 
                     # 打印消息
                     for item in msg.get("item_list", []):
@@ -1124,9 +1134,15 @@ def console_loop():
                 print("未选择账号，输入 /bots 选择")
                 continue
 
-            if not user.ilink_user_id or not user.context_token:
-                print("当前账号没有消息上下文，请先收到一条消息")
+            # 检查上下文
+            if not user.ilink_user_id:
+                print("当前账号没有收到过消息，无法确定发送对象")
+                print("提示：请先向「微信ClawBot」发送一条消息激活上下文")
                 continue
+            
+            if not user.context_token:
+                print(f"警告：context_token 为空，发送可能失败")
+                print(f"当前发送目标: {user.ilink_user_id}")
 
             if send_text_message(user, user.ilink_user_id, text, user.context_token):
                 print("发送成功!")
