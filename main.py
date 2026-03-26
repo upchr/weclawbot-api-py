@@ -543,8 +543,7 @@ def renewal_reminder_checker():
     
     while True:
         try:
-            time.sleep(3600)  # 每小时检查一次
-            
+            # 先检查，再 sleep（启动后立即检查一次）
             current_time = time.time()
             
             for bot_id, user in list(cfg.bots.items()):
@@ -588,6 +587,9 @@ def renewal_reminder_checker():
                     user.renewal_notified = True
                     cfg.lock.release()
                     cfg.save()
+            
+            # 检查完成后等待 1 小时
+            time.sleep(3600)
                     
         except Exception as e:
             print(f"[续期提醒] 检查异常: {e}")
