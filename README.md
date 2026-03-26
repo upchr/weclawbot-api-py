@@ -344,26 +344,25 @@ curl -G 'http://localhost:26322/bots/{bot_id}/messages' \
 
 **功能说明**：
 - 用户发送消息后，系统记录时间
-- 20 小时后自动提醒用户续期
-- 支持飞书 Webhook 通知（可选）
+- 20 小时后**自动发送微信消息**提醒用户续期
+- 用户回复任意消息即可续期
 
-**启用飞书通知**：
-```bash
-# 设置环境变量
-export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
-
-# 启动服务
-python main.py
-```
-
-**提醒内容**：
+**提醒消息示例**：
 ```
 ⚠️ 微信机器人续期提醒
-Bot: xxx@im.bot
-距离上次消息: 20.5 小时
-微信用户: xxx@im.wechat
 
-请向「微信ClawBot」发送任意消息续期，否则将在 4 小时后过期。
+距离上次消息: 20.5 小时
+微信机器人将在 4 小时后过期。
+
+请回复任意消息续期，保持服务可用。
+```
+
+**可选：飞书通知**
+
+```bash
+# 设置环境变量，同时发送飞书通知
+export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+python main.py
 ```
 
 ### Q: 如何发送给指定用户？

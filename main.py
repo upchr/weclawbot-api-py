@@ -535,7 +535,7 @@ def send_feishu_notification(title: str, content: str) -> bool:
 def renewal_reminder_checker():
     """
     续期提醒检查器（后台线程）
-    每小时检查一次，如果超过 20 小时未收到消息，发送续期提醒
+    每小时检查一次，如果超过 20 小时未收到消息，通过微信发送续期提醒
     """
     RENEWAL_HOURS = 20  # 20 小时后提醒
     
@@ -558,18 +558,29 @@ def renewal_reminder_checker():
                     print(f"\n{'='*60}")
                     print(f"[续期提醒] Bot: {bot_id}")
                     print(f"  距离上次消息: {hours_since_last_msg:.1f} 小时")
-                    print(f"  微信用户: {user.ilink_user_id}")
-                    print(f"  请发送消息到「微信ClawBot」续期")
+                    print(f"  发送微信续期提醒...")
                     print(f"{'='*60}\n")
                     
-                    # 发送飞书通知
+                    # 通过微信发送续期提醒消息
+                    reminder_text = (
+                        "⚠️ 微信机器人续期提醒\n\n"
+                        f"距离上次消息: {hours_since_last_msg:.1f} 小时\n"
+                        "微信机器人将在 4 小时后过期。\n\n"
+                        "请回复任意消息续期，保持服务可用。"
+                    )
+                    
+                    if send_text_message(user, user.ilink_user_id, reminder_text, user.context_token):
+                        print(f"[续期提醒] 已发送到微信: {user.ilink_user_id}")
+                    else:
+                        print(f"[续期提醒] 发送失败，可能已过期")
+                    
+                    # 发送飞书通知（可选）
                     if FEISHU_WEBHOOK_URL:
                         send_feishu_notification(
                             "⚠️ 微信机器人续期提醒",
                             f"Bot: {bot_id}\n"
                             f"距离上次消息: {hours_since_last_msg:.1f} 小时\n"
-                            f"微信用户: {user.ilink_user_id}\n\n"
-                            f"请向「微信ClawBot」发送任意消息续期，否则将在 4 小时后过期。"
+                            f"微信用户: {user.ilink_user_id}"
                         )
                     
                     # 标记已提醒
