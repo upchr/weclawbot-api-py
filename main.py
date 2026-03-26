@@ -55,6 +55,9 @@ class UserConfig:
         self.api_token: str = data.get("api_token", "")
         self.base_url: str = data.get("base_url", DEFAULT_BASE_URL)
         self.cdn_base_url: str = data.get("cdn_base_url", DEFAULT_CDN_BASE_URL)
+        # 续期提醒相关
+        self.last_message_time: float = data.get("last_message_time", 0)
+        self.renewal_notified: bool = data.get("renewal_notified", False)  # 是否已发送续期提醒
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +69,8 @@ class UserConfig:
             "api_token": self.api_token,
             "base_url": self.base_url,
             "cdn_base_url": self.cdn_base_url,
+            "last_message_time": self.last_message_time,
+            "renewal_notified": self.renewal_notified,
         }
 
 
@@ -504,6 +509,80 @@ def send_typing(user: UserConfig, status: int = 1) -> bool:
         return False
 
 
+# 飞书通知配置（可选）
+FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+def send_feishu_notification(title: str, content: str) -> bool:
+    """发送飞书通知"""
+    if not FEISHU_WEBHOOK_URL:
+        return False
+    
+    try:
+        resp = requests.post(
+            FEISHU_WEBHOOK_URL,
+            json={
+                "msg_type": "text",
+                "content": {"text": f"{title}\n\n{content}"}
+            },
+            timeout=10
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"发送飞书通知失败: {e}")
+        return False
+
+
+def renewal_reminder_checker():
+    """
+    续期提醒检查器（后台线程）
+    每小时检查一次，如果超过 20 小时未收到消息，发送续期提醒
+    """
+    RENEWAL_HOURS = 20  # 20 小时后提醒
+    
+    print("[续期提醒] 后台检查线程已启动")
+    
+    while True:
+        try:
+            time.sleep(3600)  # 每小时检查一次
+            
+            current_time = time.time()
+            
+            for bot_id, user in list(cfg.bots.items()):
+                if not user.last_message_time or not user.ilink_user_id:
+                    continue
+                
+                hours_since_last_msg = (current_time - user.last_message_time) / 3600
+                
+                # 超过 20 小时且未发送过提醒
+                if hours_since_last_msg >= RENEWAL_HOURS and not user.renewal_notified:
+                    print(f"\n{'='*60}")
+                    print(f"[续期提醒] Bot: {bot_id}")
+                    print(f"  距离上次消息: {hours_since_last_msg:.1f} 小时")
+                    print(f"  微信用户: {user.ilink_user_id}")
+                    print(f"  请发送消息到「微信ClawBot」续期")
+                    print(f"{'='*60}\n")
+                    
+                    # 发送飞书通知
+                    if FEISHU_WEBHOOK_URL:
+                        send_feishu_notification(
+                            "⚠️ 微信机器人续期提醒",
+                            f"Bot: {bot_id}\n"
+                            f"距离上次消息: {hours_since_last_msg:.1f} 小时\n"
+                            f"微信用户: {user.ilink_user_id}\n\n"
+                            f"请向「微信ClawBot」发送任意消息续期，否则将在 4 小时后过期。"
+                        )
+                    
+                    # 标记已提醒
+                    cfg.lock.acquire()
+                    user.renewal_notified = True
+                    cfg.lock.release()
+                    cfg.save()
+                    
+        except Exception as e:
+            print(f"[续期提醒] 检查异常: {e}")
+            time.sleep(60)
+
+
 def monitor_weixin(user: UserConfig):
     """监听微信消息 (长轮询)"""
     print(f"[Bot: {user.bot_id}] 开始监听消息...")
@@ -552,6 +631,11 @@ def monitor_weixin(user: UserConfig):
             msgs = data.get("msgs", [])
             if msgs:
                 print(f"[Bot: {user.bot_id}] 收到 {len(msgs)} 条消息")
+                # 更新最后收到消息的时间
+                cfg.lock.acquire()
+                user.last_message_time = time.time()
+                user.renewal_notified = False  # 收到消息后重置提醒状态
+                cfg.lock.release()
             
             for msg in msgs:
                 from_user = msg.get("from_user_id", "")
@@ -1092,7 +1176,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("WeClawBot-API Python版本 v1.2.0")
+    print("WeClawBot-API Python版本 v1.3.0")
     print("基于微信ClawBot (iLink) 的消息推送服务")
     print("=" * 60)
 
@@ -1119,6 +1203,9 @@ def main():
     # 启动所有账号的监听
     for user in cfg.bots.values():
         threading.Thread(target=monitor_weixin, args=(user,), daemon=True).start()
+    
+    # 启动续期提醒检查器
+    threading.Thread(target=renewal_reminder_checker, daemon=True).start()
 
     # 信号处理
     def signal_handler(sig, frame):
