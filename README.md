@@ -309,6 +309,26 @@ services:
 - 参数名: `encrypted_query_param`（不是 `upload_param`）
 - 响应头: `x-encrypted-query-param`（不是 `x-encrypted-param`）
 
+### Q: 发送中文消息显示乱码？
+
+**A**: 这是 URL 编码问题。**推荐使用 POST 方式发送中文**：
+
+```bash
+# ✅ 推荐：POST 方式（中文正常显示）
+curl -X POST 'http://localhost:26322/bots/{bot_id}/messages' \
+  -H 'Content-Type: application/json; charset=utf-8' \
+  -H 'Authorization: Bearer {api_token}' \
+  -d '{"text": "你好，测试消息"}'
+
+# ❌ 不推荐：GET 方式直接传中文（可能乱码）
+curl "http://localhost:26322/bots/{bot_id}/messages?token={api_token}&text=测试"
+
+# ✅ 如果必须用 GET，需要 URL 编码
+curl -G 'http://localhost:26322/bots/{bot_id}/messages' \
+  -H 'Authorization: Bearer {api_token}' \
+  --data-urlencode 'text=测试消息'
+```
+
 ### Q: 提示"当前账号没有消息上下文"？
 
 **A**: 需要先向「微信ClawBot」发送一条消息激活上下文。系统需要获取 `context_token` 才能发送消息。
