@@ -21,7 +21,7 @@ import base64
 import hashlib
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from io import BytesIO
@@ -33,9 +33,14 @@ from Crypto.Util.Padding import pad, unpad
 
 # 默认配置
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
-DEFAULT_CDN_BASE_URL = "https://wxbot-cdn.wechat.com"
+DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 DEFAULT_PORT = 26322
 CONFIG_PATH = Path("./config/auth.json")
+
+# 媒体类型常量
+MEDIA_TYPE_IMAGE = 1
+MEDIA_TYPE_VIDEO = 2
+MEDIA_TYPE_FILE = 3
 
 
 class UserConfig:
@@ -164,122 +169,12 @@ class AESCipher:
         return base64.b64encode(hex_str.encode('ascii')).decode()
 
 
-class CDNUploader:
-    """微信 CDN 上传工具"""
-    
-    MAX_RETRIES = 3
-    
-    @classmethod
-    def get_upload_url(cls, user: UserConfig, filekey: str, aeskey_hex: str, 
-                       rawsize: int, filesize: int, media_type: int = 2) -> Optional[dict]:
-        """
-        获取 CDN 上传 URL
-        
-        Args:
-            user: 用户配置
-            filekey: 文件标识
-            aeskey_hex: AES 密钥 (hex字符串)
-            rawsize: 原始文件大小
-            filesize: 加密后文件大小
-            media_type: 媒体类型 (2=图片, 4=视频, 5=文件)
-        
-        Returns:
-            {"upload_param": "...", "cdn_url": "..."} 或 None
-        """
-        try:
-            req_data = {
-                "filekey": filekey,
-                "media_type": media_type,
-                "to_user_id": user.ilink_user_id,
-                "rawsize": str(rawsize),
-                "rawfilemd5": "",
-                "filesize": str(filesize),
-                "thumb_rawsize": "0",
-                "thumb_rawfilemd5": "",
-                "thumb_filesize": "0",
-                "no_need_thumb": 1,
-                "aeskey": aeskey_hex,
-                "base_info": {"channel_version": "1.0.3"}
-            }
-            
-            resp = requests.post(
-                f"{user.base_url}/ilink/bot/getuploadurl",
-                json=req_data,
-                headers=common_headers(user.bot_token),
-                timeout=15
-            )
-            
-            data = resp.json()
-            if data.get("ret") == 0:
-                return {
-                    "upload_param": data.get("upload_param", ""),
-                    "cdn_url": data.get("cdn_url", user.cdn_base_url),
-                }
-            
-            print(f"获取上传URL失败: {data}")
-            return None
-            
-        except Exception as e:
-            print(f"获取上传URL异常: {e}")
-            return None
-    
-    @classmethod
-    def upload_to_cdn(cls, cdn_base_url: str, upload_param: str, filekey: str, 
-                      ciphertext: bytes, label: str = "upload") -> Optional[str]:
-        """
-        上传加密数据到 CDN
-        
-        Args:
-            cdn_base_url: CDN 基础 URL
-            upload_param: 上传参数
-            filekey: 文件标识
-            ciphertext: 加密后的文件数据
-        
-        Returns:
-            download_param (encrypt_query_param) 或 None
-        """
-        # 构建上传 URL
-        cdn_url = f"{cdn_base_url}/upload?upload_param={upload_param}&filekey={filekey}"
-        
-        for attempt in range(1, cls.MAX_RETRIES + 1):
-            try:
-                resp = requests.post(
-                    cdn_url,
-                    data=ciphertext,
-                    headers={"Content-Type": "application/octet-stream"},
-                    timeout=30
-                )
-                
-                if resp.status_code >= 400 and resp.status_code < 500:
-                    err_msg = resp.headers.get("x-error-message", resp.text)
-                    print(f"{label}: CDN 客户端错误 {resp.status_code}: {err_msg}")
-                    return None
-                
-                if resp.status_code != 200:
-                    err_msg = resp.headers.get("x-error-message", f"status {resp.status_code}")
-                    print(f"{label}: CDN 服务端错误 (尝试 {attempt}/{cls.MAX_RETRIES}): {err_msg}")
-                    if attempt < cls.MAX_RETRIES:
-                        time.sleep(1)
-                    continue
-                
-                # 获取下载参数 - 必须用 x-encrypted-query-param！
-                download_param = resp.headers.get("x-encrypted-query-param")
-                if download_param:
-                    print(f"{label}: CDN 上传成功")
-                    return download_param
-                else:
-                    print(f"{label}: CDN 响应缺少 x-encrypted-query-param")
-                    return None
-                    
-            except Exception as e:
-                print(f"{label}: CDN 上传异常 (尝试 {attempt}/{cls.MAX_RETRIES}): {e}")
-                if attempt < cls.MAX_RETRIES:
-                    time.sleep(1)
-        
-        return None
+def aes_ecb_padded_size(plaintext_size: int) -> int:
+    """计算 AES-128-ECB 加密后的大小（PKCS7 padding）"""
+    return ((plaintext_size + 16) // 16) * 16
 
 
-def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = 2, 
+def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = MEDIA_TYPE_IMAGE, 
                        filename: str = "file") -> Optional[dict]:
     """
     完整的文件上传流程
@@ -287,7 +182,7 @@ def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = 2,
     Args:
         user: 用户配置
         file_data: 原始文件数据
-        media_type: 媒体类型 (2=图片, 4=视频, 5=文件)
+        media_type: 媒体类型 (IMAGE=1, VIDEO=2, FILE=3)
         filename: 文件名
     
     Returns:
@@ -299,36 +194,91 @@ def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = 2,
             "rawsize": 原始大小
         }
     """
-    # 1. 生成 AES 密钥
+    # 1. 计算文件信息
+    rawsize = len(file_data)
+    rawfilemd5 = hashlib.md5(file_data).hexdigest()
+    filesize = aes_ecb_padded_size(rawsize)
+    
+    # 2. 生成 AES 密钥
     aeskey = AESCipher.generate_key()
     aeskey_hex = AESCipher.key_to_hex(aeskey)
     aeskey_base64 = AESCipher.key_to_base64(aeskey)
     
-    # 2. AES-128-ECB 加密
-    ciphertext = AESCipher.encrypt(file_data, file_data)
-    
     # 3. 生成文件标识
-    filekey = f"weclawbot_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    filekey = os.urandom(16).hex()
     
     # 4. 获取上传 URL
-    upload_info = CDNUploader.get_upload_url(
-        user, filekey, aeskey_hex,
-        len(file_data), len(ciphertext), media_type
-    )
+    req_data = {
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": user.ilink_user_id,
+        "rawsize": rawsize,           # 数字
+        "rawfilemd5": rawfilemd5,     # MD5 字符串
+        "filesize": filesize,         # 数字
+        "thumb_rawsize": 0,
+        "thumb_rawfilemd5": "",
+        "thumb_filesize": 0,
+        "no_need_thumb": True,        # 布尔值
+        "aeskey": aeskey_hex,
+        "base_info": {"channel_version": "1.0.3"}
+    }
     
-    if not upload_info:
+    try:
+        resp = requests.post(
+            f"{user.base_url}/ilink/bot/getuploadurl",
+            json=req_data,
+            headers=common_headers(user.bot_token),
+            timeout=15
+        )
+        
+        data = resp.json()
+        
+        # 检查错误（ret 不为 0 且存在）
+        if data.get("ret") is not None and data.get("ret") != 0:
+            print(f"获取上传URL失败: {data}")
+            return None
+        
+        upload_param = data.get("upload_param", "")
+        cdn_url = data.get("cdn_url", user.cdn_base_url)
+        
+        if not upload_param:
+            print("响应中没有 upload_param")
+            return None
+        
+    except Exception as e:
+        print(f"获取上传URL异常: {e}")
         return None
     
-    # 5. 上传到 CDN
-    download_param = CDNUploader.upload_to_cdn(
-        upload_info["cdn_url"],
-        upload_info["upload_param"],
-        filekey,
-        ciphertext,
-        filename
-    )
+    # 5. AES-128-ECB 加密
+    ciphertext = AESCipher.encrypt(file_data, aeskey)
     
-    if not download_param:
+    # 6. 上传到 CDN
+    # 注意：使用 encrypted_query_param 参数名，不是 upload_param
+    cdn_full_url = f"{cdn_url}/upload?encrypted_query_param={upload_param}&filekey={filekey}"
+    
+    try:
+        resp = requests.post(
+            cdn_full_url,
+            data=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=30
+        )
+        
+        if resp.status_code != 200:
+            err_msg = resp.headers.get("x-error-message", resp.text)
+            print(f"CDN 上传失败: {resp.status_code} - {err_msg}")
+            return None
+        
+        # 7. 获取下载参数 - 必须用 x-encrypted-query-param！
+        download_param = resp.headers.get("x-encrypted-query-param")
+        if not download_param:
+            print("CDN 响应缺少 x-encrypted-query-param")
+            return None
+        
+        print(f"{filename}: CDN 上传成功")
+        
+    except Exception as e:
+        print(f"CDN 上传异常: {e}")
         return None
     
     return {
@@ -336,7 +286,7 @@ def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = 2,
         "aes_key": aeskey_base64,
         "encrypt_query_param": download_param,
         "filesize": len(ciphertext),
-        "rawsize": len(file_data)
+        "rawsize": rawsize
     }
 
 
@@ -368,8 +318,9 @@ def send_text_message(user: UserConfig, to: str, text: str, context_token: str =
             timeout=15
         )
         data = resp.json()
-        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
-            return True
+        if data.get("ret") is None or data.get("ret") == 0:
+            if data.get("errcode", 0) == 0:
+                return True
         print(f"发送失败: {data}")
         return False
     except Exception as e:
@@ -379,15 +330,7 @@ def send_text_message(user: UserConfig, to: str, text: str, context_token: str =
 
 def send_image_message(user: UserConfig, to: str, upload_info: dict, 
                        context_token: str = "") -> bool:
-    """
-    发送图片消息
-    
-    Args:
-        user: 用户配置
-        to: 接收者 ID
-        upload_info: upload_file_to_cdn 返回的上传信息
-        context_token: 上下文 token
-    """
+    """发送图片消息"""
     req_data = {
         "msg": {
             "from_user_id": "",
@@ -421,8 +364,9 @@ def send_image_message(user: UserConfig, to: str, upload_info: dict,
             timeout=15
         )
         data = resp.json()
-        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
-            return True
+        if data.get("ret") is None or data.get("ret") == 0:
+            if data.get("errcode", 0) == 0:
+                return True
         print(f"发送图片失败: {data}")
         return False
     except Exception as e:
@@ -432,16 +376,7 @@ def send_image_message(user: UserConfig, to: str, upload_info: dict,
 
 def send_file_message(user: UserConfig, to: str, upload_info: dict, 
                       filename: str, context_token: str = "") -> bool:
-    """
-    发送文件消息
-    
-    Args:
-        user: 用户配置
-        to: 接收者 ID
-        upload_info: upload_file_to_cdn 返回的上传信息
-        filename: 文件名
-        context_token: 上下文 token
-    """
+    """发送文件消息"""
     req_data = {
         "msg": {
             "from_user_id": "",
@@ -475,8 +410,9 @@ def send_file_message(user: UserConfig, to: str, upload_info: dict,
             timeout=15
         )
         data = resp.json()
-        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
-            return True
+        if data.get("ret") is None or data.get("ret") == 0:
+            if data.get("errcode", 0) == 0:
+                return True
         print(f"发送文件失败: {data}")
         return False
     except Exception as e:
@@ -497,7 +433,7 @@ def send_video_message(user: UserConfig, to: str, upload_info: dict,
             "context_token": context_token or user.context_token,
             "item_list": [
                 {
-                    "type": 3,  # VIDEO
+                    "type": 5,  # VIDEO (注意：根据 types.ts，VIDEO=5)
                     "video_item": {
                         "media": {
                             "encrypt_query_param": upload_info["encrypt_query_param"],
@@ -519,8 +455,9 @@ def send_video_message(user: UserConfig, to: str, upload_info: dict,
             timeout=15
         )
         data = resp.json()
-        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
-            return True
+        if data.get("ret") is None or data.get("ret") == 0:
+            if data.get("errcode", 0) == 0:
+                return True
         print(f"发送视频失败: {data}")
         return False
     except Exception as e:
@@ -589,7 +526,7 @@ def monitor_weixin(user: UserConfig):
             data = resp.json()
 
             # 检查错误
-            if data.get("ret") != 0 or data.get("errcode", 0) != 0:
+            if data.get("ret") is not None and data.get("ret") != 0:
                 errcode = data.get("errcode", data.get("ret"))
                 print(f"[Bot: {user.bot_id}] 监听异常: errcode={errcode}, errmsg={data.get('errmsg', '')}")
                 
@@ -620,8 +557,6 @@ def monitor_weixin(user: UserConfig):
                 from_user = msg.get("from_user_id", "")
                 context_token = msg.get("context_token", "")
                 
-                print(f"[DEBUG] from_user={from_user}, context_token={context_token[:20] if context_token else 'None'}...")
-                
                 if from_user:
                     # 始终更新 ilink_user_id
                     cfg.lock.acquire()
@@ -641,7 +576,7 @@ def monitor_weixin(user: UserConfig):
                             print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: {text}")
                         elif msg_type == 2:
                             print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <图片>")
-                        elif msg_type == 3:
+                        elif msg_type == 5:
                             print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <视频>")
                         elif msg_type == 4:
                             file_name = item.get("file_item", {}).get("file_name", "")
@@ -776,7 +711,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 except:
                     pass
             elif "application/x-www-form-urlencoded" in content_type:
-                from urllib.parse import parse_qs
                 form_data = parse_qs(body.decode())
                 for k, v in form_data.items():
                     self._json_body[k] = v[0] if v else ""
@@ -891,7 +825,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 image_data = base64.b64decode(image_base64)
 
             # 上传到 CDN
-            upload_info = upload_file_to_cdn(user, image_data, media_type=2, filename="image.jpg")
+            upload_info = upload_file_to_cdn(user, image_data, media_type=MEDIA_TYPE_IMAGE, filename="image.jpg")
             if not upload_info:
                 self.send_json(500, {"code": 500, "error": "CDN upload failed"})
                 return
@@ -933,7 +867,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 file_data = base64.b64decode(file_base64)
 
             # 上传到 CDN
-            upload_info = upload_file_to_cdn(user, file_data, media_type=5, filename=filename)
+            upload_info = upload_file_to_cdn(user, file_data, media_type=MEDIA_TYPE_FILE, filename=filename)
             if not upload_info:
                 self.send_json(500, {"code": 500, "error": "CDN upload failed"})
                 return
@@ -974,7 +908,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 video_data = base64.b64decode(video_base64)
 
             # 上传到 CDN
-            upload_info = upload_file_to_cdn(user, video_data, media_type=4, filename="video.mp4")
+            upload_info = upload_file_to_cdn(user, video_data, media_type=MEDIA_TYPE_VIDEO, filename="video.mp4")
             if not upload_info:
                 self.send_json(500, {"code": 500, "error": "CDN upload failed"})
                 return
@@ -991,7 +925,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def _handle_upload(self, user: UserConfig):
         """仅上传文件到 CDN"""
         file_base64 = self.get_param("file_base64")
-        media_type = int(self.get_param("media_type", "2"))  # 默认图片
+        media_type = int(self.get_param("media_type", "1"))  # 默认图片
         filename = self.get_param("filename", "file")
         
         if not file_base64:
@@ -1134,15 +1068,10 @@ def console_loop():
                 print("未选择账号，输入 /bots 选择")
                 continue
 
-            # 检查上下文
             if not user.ilink_user_id:
                 print("当前账号没有收到过消息，无法确定发送对象")
                 print("提示：请先向「微信ClawBot」发送一条消息激活上下文")
                 continue
-            
-            if not user.context_token:
-                print(f"警告：context_token 为空，发送可能失败")
-                print(f"当前发送目标: {user.ilink_user_id}")
 
             if send_text_message(user, user.ilink_user_id, text, user.context_token):
                 print("发送成功!")
@@ -1163,7 +1092,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("WeClawBot-API Python版本 v1.1.0")
+    print("WeClawBot-API Python版本 v1.2.0")
     print("基于微信ClawBot (iLink) 的消息推送服务")
     print("=" * 60)
 
