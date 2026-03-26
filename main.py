@@ -3,6 +3,10 @@
 """
 WeClawBot-API Python版本
 基于微信ClawBot (iLink) 的个人微信消息推送 API 服务
+
+关键实现基于对 @tencent-weixin/openclaw-weixin 插件的逆向学习：
+- CDN 上传：AES-128-ECB 加密
+- 图片/文件发送：正确的 aes_key 格式和 encrypt_query_param
 """
 
 import argparse
@@ -14,18 +18,22 @@ import threading
 import time
 import uuid
 import base64
+import hashlib
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import io
+from io import BytesIO
 
 import qrcode
 import requests
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
 # 默认配置
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
+DEFAULT_CDN_BASE_URL = "https://wxbot-cdn.wechat.com"
 DEFAULT_PORT = 26322
 CONFIG_PATH = Path("./config/auth.json")
 
@@ -40,6 +48,8 @@ class UserConfig:
         self.ilink_user_id: str = data.get("ilink_user_id", "")
         self.context_token: str = data.get("context_token", "")
         self.api_token: str = data.get("api_token", "")
+        self.base_url: str = data.get("base_url", DEFAULT_BASE_URL)
+        self.cdn_base_url: str = data.get("cdn_base_url", DEFAULT_CDN_BASE_URL)
 
     def to_dict(self) -> dict:
         return {
@@ -49,6 +59,8 @@ class UserConfig:
             "ilink_user_id": self.ilink_user_id,
             "context_token": self.context_token,
             "api_token": self.api_token,
+            "base_url": self.base_url,
+            "cdn_base_url": self.cdn_base_url,
         }
 
 
@@ -115,32 +127,245 @@ def common_headers(token: str = "") -> dict:
     return headers
 
 
-def send_message(user: UserConfig, to: str, text: str, context_token: str) -> bool:
+class AESCipher:
+    """AES-128-ECB 加密工具"""
+    
+    @staticmethod
+    def generate_key() -> bytes:
+        """生成随机 AES 密钥 (16字节)"""
+        return os.urandom(16)
+    
+    @staticmethod
+    def encrypt(plaintext: bytes, key: bytes) -> bytes:
+        """AES-128-ECB 加密 (PKCS7 padding)"""
+        cipher = AES.new(key, AES.MODE_ECB)
+        padded = pad(plaintext, AES.block_size)
+        return cipher.encrypt(padded)
+    
+    @staticmethod
+    def decrypt(ciphertext: bytes, key: bytes) -> bytes:
+        """AES-128-ECB 解密"""
+        cipher = AES.new(key, AES.MODE_ECB)
+        padded = cipher.decrypt(ciphertext)
+        return unpad(padded, AES.block_size)
+    
+    @staticmethod
+    def key_to_hex(key: bytes) -> str:
+        """密钥转 hex 字符串"""
+        return key.hex()
+    
+    @staticmethod
+    def key_to_base64(key: bytes) -> str:
+        """
+        微信特殊格式：把 hex 字符串当 ASCII 编码后再 base64
+        不是直接 base64 编码原始字节！
+        """
+        hex_str = key.hex()
+        return base64.b64encode(hex_str.encode('ascii')).decode()
+
+
+class CDNUploader:
+    """微信 CDN 上传工具"""
+    
+    MAX_RETRIES = 3
+    
+    @classmethod
+    def get_upload_url(cls, user: UserConfig, filekey: str, aeskey_hex: str, 
+                       rawsize: int, filesize: int, media_type: int = 2) -> Optional[dict]:
+        """
+        获取 CDN 上传 URL
+        
+        Args:
+            user: 用户配置
+            filekey: 文件标识
+            aeskey_hex: AES 密钥 (hex字符串)
+            rawsize: 原始文件大小
+            filesize: 加密后文件大小
+            media_type: 媒体类型 (2=图片, 4=视频, 5=文件)
+        
+        Returns:
+            {"upload_param": "...", "cdn_url": "..."} 或 None
+        """
+        try:
+            req_data = {
+                "filekey": filekey,
+                "media_type": media_type,
+                "to_user_id": user.ilink_user_id,
+                "rawsize": str(rawsize),
+                "rawfilemd5": "",
+                "filesize": str(filesize),
+                "thumb_rawsize": "0",
+                "thumb_rawfilemd5": "",
+                "thumb_filesize": "0",
+                "no_need_thumb": 1,
+                "aeskey": aeskey_hex,
+                "base_info": {"channel_version": "1.0.3"}
+            }
+            
+            resp = requests.post(
+                f"{user.base_url}/ilink/bot/getuploadurl",
+                json=req_data,
+                headers=common_headers(user.bot_token),
+                timeout=15
+            )
+            
+            data = resp.json()
+            if data.get("ret") == 0:
+                return {
+                    "upload_param": data.get("upload_param", ""),
+                    "cdn_url": data.get("cdn_url", user.cdn_base_url),
+                }
+            
+            print(f"获取上传URL失败: {data}")
+            return None
+            
+        except Exception as e:
+            print(f"获取上传URL异常: {e}")
+            return None
+    
+    @classmethod
+    def upload_to_cdn(cls, cdn_base_url: str, upload_param: str, filekey: str, 
+                      ciphertext: bytes, label: str = "upload") -> Optional[str]:
+        """
+        上传加密数据到 CDN
+        
+        Args:
+            cdn_base_url: CDN 基础 URL
+            upload_param: 上传参数
+            filekey: 文件标识
+            ciphertext: 加密后的文件数据
+        
+        Returns:
+            download_param (encrypt_query_param) 或 None
+        """
+        # 构建上传 URL
+        cdn_url = f"{cdn_base_url}/upload?upload_param={upload_param}&filekey={filekey}"
+        
+        for attempt in range(1, cls.MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    cdn_url,
+                    data=ciphertext,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=30
+                )
+                
+                if resp.status_code >= 400 and resp.status_code < 500:
+                    err_msg = resp.headers.get("x-error-message", resp.text)
+                    print(f"{label}: CDN 客户端错误 {resp.status_code}: {err_msg}")
+                    return None
+                
+                if resp.status_code != 200:
+                    err_msg = resp.headers.get("x-error-message", f"status {resp.status_code}")
+                    print(f"{label}: CDN 服务端错误 (尝试 {attempt}/{cls.MAX_RETRIES}): {err_msg}")
+                    if attempt < cls.MAX_RETRIES:
+                        time.sleep(1)
+                    continue
+                
+                # 获取下载参数 - 必须用 x-encrypted-query-param！
+                download_param = resp.headers.get("x-encrypted-query-param")
+                if download_param:
+                    print(f"{label}: CDN 上传成功")
+                    return download_param
+                else:
+                    print(f"{label}: CDN 响应缺少 x-encrypted-query-param")
+                    return None
+                    
+            except Exception as e:
+                print(f"{label}: CDN 上传异常 (尝试 {attempt}/{cls.MAX_RETRIES}): {e}")
+                if attempt < cls.MAX_RETRIES:
+                    time.sleep(1)
+        
+        return None
+
+
+def upload_file_to_cdn(user: UserConfig, file_data: bytes, media_type: int = 2, 
+                       filename: str = "file") -> Optional[dict]:
+    """
+    完整的文件上传流程
+    
+    Args:
+        user: 用户配置
+        file_data: 原始文件数据
+        media_type: 媒体类型 (2=图片, 4=视频, 5=文件)
+        filename: 文件名
+    
+    Returns:
+        {
+            "aeskey": "hex字符串",
+            "aes_key": "base64编码",
+            "encrypt_query_param": "...",
+            "filesize": 加密后大小,
+            "rawsize": 原始大小
+        }
+    """
+    # 1. 生成 AES 密钥
+    aeskey = AESCipher.generate_key()
+    aeskey_hex = AESCipher.key_to_hex(aeskey)
+    aeskey_base64 = AESCipher.key_to_base64(aeskey)
+    
+    # 2. AES-128-ECB 加密
+    ciphertext = AESCipher.encrypt(file_data, file_data)
+    
+    # 3. 生成文件标识
+    filekey = f"weclawbot_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    
+    # 4. 获取上传 URL
+    upload_info = CDNUploader.get_upload_url(
+        user, filekey, aeskey_hex,
+        len(file_data), len(ciphertext), media_type
+    )
+    
+    if not upload_info:
+        return None
+    
+    # 5. 上传到 CDN
+    download_param = CDNUploader.upload_to_cdn(
+        upload_info["cdn_url"],
+        upload_info["upload_param"],
+        filekey,
+        ciphertext,
+        filename
+    )
+    
+    if not download_param:
+        return None
+    
+    return {
+        "aeskey": aeskey_hex,
+        "aes_key": aeskey_base64,
+        "encrypt_query_param": download_param,
+        "filesize": len(ciphertext),
+        "rawsize": len(file_data)
+    }
+
+
+def send_text_message(user: UserConfig, to: str, text: str, context_token: str = "") -> bool:
     """发送文本消息"""
     req_data = {
         "msg": {
             "from_user_id": "",
             "to_user_id": to,
-            "client_id": f"openclaw-weixin:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
-            "message_type": 2,
-            "message_state": 2,
-            "context_token": context_token,
+            "client_id": f"weclawbot:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+            "message_type": 2,  # BOT
+            "message_state": 2,  # FINISH
+            "context_token": context_token or user.context_token,
             "item_list": [
                 {
-                    "type": 1,
+                    "type": 1,  # TEXT
                     "text_item": {"text": text}
                 }
             ]
         },
-        "base_info": {"channel_version": "1.0.2"}
+        "base_info": {"channel_version": "1.0.3"}
     }
 
     try:
         resp = requests.post(
-            f"{DEFAULT_BASE_URL}/ilink/bot/sendmessage",
+            f"{user.base_url}/ilink/bot/sendmessage",
             json=req_data,
             headers=common_headers(user.bot_token),
-            timeout=10
+            timeout=15
         )
         data = resp.json()
         if data.get("ret") == 0 and data.get("errcode", 0) == 0:
@@ -152,70 +377,48 @@ def send_message(user: UserConfig, to: str, text: str, context_token: str) -> bo
         return False
 
 
-def upload_image(user: UserConfig, image_data: bytes, filename: str = "image.jpg") -> Optional[str]:
-    """
-    上传图片到微信服务器
-    返回 image_url 或 None
-    """
-    try:
-        # 构建multipart/form-data请求
-        files = {
-            "file": (filename, image_data, "image/jpeg")
-        }
-        
-        resp = requests.post(
-            f"{DEFAULT_BASE_URL}/ilink/bot/uploadimage",
-            files=files,
-            headers={
-                "AuthorizationType": "ilink_bot_token",
-                "X-WECHAT-UIN": random_wechat_uin(),
-                "Authorization": f"Bearer {user.bot_token}",
-            },
-            timeout=30
-        )
-        
-        data = resp.json()
-        if data.get("ret") == 0:
-            # 返回图片URL
-            return data.get("image_url") or data.get("url") or data.get("media_id")
-        print(f"上传图片失败: {data}")
-        return None
-    except Exception as e:
-        print(f"上传图片异常: {e}")
-        return None
-
-
-def send_image(user: UserConfig, to: str, image_url: str, context_token: str) -> bool:
+def send_image_message(user: UserConfig, to: str, upload_info: dict, 
+                       context_token: str = "") -> bool:
     """
     发送图片消息
-    image_url: 图片URL或base64数据
+    
+    Args:
+        user: 用户配置
+        to: 接收者 ID
+        upload_info: upload_file_to_cdn 返回的上传信息
+        context_token: 上下文 token
     """
     req_data = {
         "msg": {
             "from_user_id": "",
             "to_user_id": to,
-            "client_id": f"openclaw-weixin:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
-            "message_type": 2,
-            "message_state": 2,
-            "context_token": context_token,
+            "client_id": f"weclawbot:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+            "message_type": 2,  # BOT
+            "message_state": 2,  # FINISH
+            "context_token": context_token or user.context_token,
             "item_list": [
                 {
-                    "type": 3,  # 图片类型
+                    "type": 2,  # IMAGE
                     "image_item": {
-                        "image_url": image_url
+                        "aeskey": upload_info["aeskey"],
+                        "media": {
+                            "encrypt_query_param": upload_info["encrypt_query_param"],
+                            "aes_key": upload_info["aes_key"]
+                        },
+                        "mid_size": upload_info["filesize"]
                     }
                 }
             ]
         },
-        "base_info": {"channel_version": "1.0.2"}
+        "base_info": {"channel_version": "1.0.3"}
     }
 
     try:
         resp = requests.post(
-            f"{DEFAULT_BASE_URL}/ilink/bot/sendmessage",
+            f"{user.base_url}/ilink/bot/sendmessage",
             json=req_data,
             headers=common_headers(user.bot_token),
-            timeout=10
+            timeout=15
         )
         data = resp.json()
         if data.get("ret") == 0 and data.get("errcode", 0) == 0:
@@ -227,17 +430,115 @@ def send_image(user: UserConfig, to: str, image_url: str, context_token: str) ->
         return False
 
 
-def send_typing(user: UserConfig, status: int = 1) -> bool:
-    """发送输入状态"""
-    # 先获取typing_ticket
+def send_file_message(user: UserConfig, to: str, upload_info: dict, 
+                      filename: str, context_token: str = "") -> bool:
+    """
+    发送文件消息
+    
+    Args:
+        user: 用户配置
+        to: 接收者 ID
+        upload_info: upload_file_to_cdn 返回的上传信息
+        filename: 文件名
+        context_token: 上下文 token
+    """
+    req_data = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to,
+            "client_id": f"weclawbot:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+            "message_type": 2,  # BOT
+            "message_state": 2,  # FINISH
+            "context_token": context_token or user.context_token,
+            "item_list": [
+                {
+                    "type": 4,  # FILE
+                    "file_item": {
+                        "media": {
+                            "encrypt_query_param": upload_info["encrypt_query_param"],
+                            "aes_key": upload_info["aes_key"]
+                        },
+                        "file_name": filename,
+                        "len": str(upload_info["rawsize"])
+                    }
+                }
+            ]
+        },
+        "base_info": {"channel_version": "1.0.3"}
+    }
+
     try:
+        resp = requests.post(
+            f"{user.base_url}/ilink/bot/sendmessage",
+            json=req_data,
+            headers=common_headers(user.bot_token),
+            timeout=15
+        )
+        data = resp.json()
+        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
+            return True
+        print(f"发送文件失败: {data}")
+        return False
+    except Exception as e:
+        print(f"发送文件异常: {e}")
+        return False
+
+
+def send_video_message(user: UserConfig, to: str, upload_info: dict, 
+                       context_token: str = "") -> bool:
+    """发送视频消息"""
+    req_data = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to,
+            "client_id": f"weclawbot:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+            "message_type": 2,  # BOT
+            "message_state": 2,  # FINISH
+            "context_token": context_token or user.context_token,
+            "item_list": [
+                {
+                    "type": 3,  # VIDEO
+                    "video_item": {
+                        "media": {
+                            "encrypt_query_param": upload_info["encrypt_query_param"],
+                            "aes_key": upload_info["aes_key"]
+                        },
+                        "video_size": upload_info["filesize"]
+                    }
+                }
+            ]
+        },
+        "base_info": {"channel_version": "1.0.3"}
+    }
+
+    try:
+        resp = requests.post(
+            f"{user.base_url}/ilink/bot/sendmessage",
+            json=req_data,
+            headers=common_headers(user.bot_token),
+            timeout=15
+        )
+        data = resp.json()
+        if data.get("ret") == 0 and data.get("errcode", 0) == 0:
+            return True
+        print(f"发送视频失败: {data}")
+        return False
+    except Exception as e:
+        print(f"发送视频异常: {e}")
+        return False
+
+
+def send_typing(user: UserConfig, status: int = 1) -> bool:
+    """发送输入状态 (1=正在输入, 2=停止)"""
+    try:
+        # 先获取 typing_ticket
         config_req = {
             "ilink_user_id": user.ilink_user_id,
             "context_token": user.context_token,
-            "base_info": {"channel_version": "1.0.0"}
+            "base_info": {"channel_version": "1.0.3"}
         }
         resp = requests.post(
-            f"{DEFAULT_BASE_URL}/ilink/bot/getconfig",
+            f"{user.base_url}/ilink/bot/getconfig",
             json=config_req,
             headers=common_headers(user.bot_token),
             timeout=10
@@ -247,15 +548,15 @@ def send_typing(user: UserConfig, status: int = 1) -> bool:
         if not typing_ticket:
             return False
 
-        # 发送typing状态
+        # 发送 typing 状态
         typing_req = {
             "ilink_user_id": user.ilink_user_id,
             "typing_ticket": typing_ticket,
             "status": status,
-            "base_info": {"channel_version": "1.0.0"}
+            "base_info": {"channel_version": "1.0.3"}
         }
         resp = requests.post(
-            f"{DEFAULT_BASE_URL}/ilink/bot/sendtyping",
+            f"{user.base_url}/ilink/bot/sendtyping",
             json=typing_req,
             headers=common_headers(user.bot_token),
             timeout=10
@@ -267,7 +568,7 @@ def send_typing(user: UserConfig, status: int = 1) -> bool:
 
 
 def monitor_weixin(user: UserConfig):
-    """监听微信消息"""
+    """监听微信消息 (长轮询)"""
     print(f"[Bot: {user.bot_id}] 开始监听消息...")
     timeout = 35
 
@@ -275,31 +576,35 @@ def monitor_weixin(user: UserConfig):
         try:
             req_data = {
                 "get_updates_buf": user.get_updates_buf,
-                "base_info": {"channel_version": "1.0.0"}
+                "base_info": {"channel_version": "1.0.3"}
             }
 
             resp = requests.post(
-                f"{DEFAULT_BASE_URL}/ilink/bot/getupdates",
+                f"{user.base_url}/ilink/bot/getupdates",
                 json=req_data,
                 headers=common_headers(user.bot_token),
                 timeout=timeout
             )
 
             data = resp.json()
-            # 调试：打印响应（只在有内容时）
-            if data.get("msgs") or data.get("ret") != 0:
-                print(f"[DEBUG] getupdates响应: ret={data.get('ret')}, errcode={data.get('errcode')}, msgs_count={len(data.get('msgs', []))}")
 
+            # 检查错误
             if data.get("ret") != 0 or data.get("errcode", 0) != 0:
-                print(f"[DEBUG] 监听异常: {data}")
+                errcode = data.get("errcode", data.get("ret"))
+                print(f"[Bot: {user.bot_id}] 监听异常: errcode={errcode}, errmsg={data.get('errmsg', '')}")
+                
+                # 会话过期
+                if errcode in [40001, 40014, 42001]:
+                    print(f"[Bot: {user.bot_id}] 会话已过期，请重新登录")
+                
                 time.sleep(2)
                 continue
 
-            # 更新timeout
+            # 更新 timeout
             if data.get("longpolling_timeout_ms"):
                 timeout = data["longpolling_timeout_ms"] / 1000 + 10
 
-            # 更新游标
+            # 更新游标 (断点续传)
             if data.get("get_updates_buf"):
                 cfg.lock.acquire()
                 user.get_updates_buf = data["get_updates_buf"]
@@ -310,10 +615,11 @@ def monitor_weixin(user: UserConfig):
             for msg in data.get("msgs", []):
                 from_user = msg.get("from_user_id", "")
                 if from_user:
-                    # 更新context
+                    # 更新 context
                     if msg.get("context_token"):
                         cfg.lock.acquire()
                         user.context_token = msg["context_token"]
+                        user.ilink_user_id = from_user
                         cfg.lock.release()
                         cfg.save()
 
@@ -323,9 +629,19 @@ def monitor_weixin(user: UserConfig):
                         if msg_type == 1:
                             text = item.get("text_item", {}).get("text", "")
                             print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: {text}")
+                        elif msg_type == 2:
+                            print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <图片>")
+                        elif msg_type == 3:
+                            print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <视频>")
+                        elif msg_type == 4:
+                            file_name = item.get("file_item", {}).get("file_name", "")
+                            print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <文件: {file_name}>")
                         else:
-                            print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <媒体/其他类型 {msg_type}>")
+                            print(f"\n[Bot: {user.bot_id} | 来自 {from_user}]: <类型 {msg_type}>")
 
+        except requests.exceptions.Timeout:
+            # 长轮询超时是正常的
+            pass
         except Exception as e:
             print(f"[Bot: {user.bot_id}] 监听异常: {e}")
             time.sleep(2)
@@ -338,7 +654,10 @@ def do_qr_login() -> Optional[UserConfig]:
     while True:
         try:
             # 获取二维码
-            resp = requests.get(f"{DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3", timeout=10)
+            resp = requests.get(
+                f"{DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3",
+                timeout=10
+            )
             qr_data = resp.json()
             qr_code = qr_data.get("qrcode", "")
             qr_img = qr_data.get("qrcode_img_content", "")
@@ -350,10 +669,11 @@ def do_qr_login() -> Optional[UserConfig]:
             # 打印二维码
             print("\n" + "=" * 50)
             qr = qrcode.QRCode(border=1)
-            qr.add_data(qr_img)
+            qr.add_data(qr_img or qr_code)
             qr.make(fit=True)
             qr.print_ascii(invert=True)
             print("=" * 50)
+            print(f"或访问: {qr_img}")
             print("请用微信扫码登录")
 
             # 轮询状态
@@ -378,7 +698,6 @@ def do_qr_login() -> Optional[UserConfig]:
                     break
                 elif status == "confirmed":
                     print(f"登录成功! BotID: {status_data.get('ilink_bot_id')}")
-                    print(f"[DEBUG] 登录返回数据: {json.dumps(status_data, indent=2, ensure_ascii=False)}")
 
                     # 创建用户配置
                     user = UserConfig({
@@ -386,8 +705,9 @@ def do_qr_login() -> Optional[UserConfig]:
                         "bot_id": status_data.get("ilink_bot_id", ""),
                         "ilink_user_id": status_data.get("ilink_user_id", ""),
                         "api_token": generate_token(16),
+                        "base_url": DEFAULT_BASE_URL,
+                        "cdn_base_url": DEFAULT_CDN_BASE_URL,
                     })
-                    print(f"[DEBUG] 用户配置: bot_token={user.bot_token[:20]}..., ilink_user_id={user.ilink_user_id}")
 
                     # 保存配置
                     cfg.lock.acquire()
@@ -419,17 +739,16 @@ class APIHandler(BaseHTTPRequestHandler):
     def send_json(self, code: int, data: dict):
         """发送JSON响应"""
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
 
-    def get_param(self, key: str) -> str:
+    def get_param(self, key: str, default: str = "") -> str:
         """获取请求参数"""
-        # 优先从JSON body获取
         if hasattr(self, '_json_body') and key in self._json_body:
             return str(self._json_body[key])
-        # 再从form获取
-        return self.query_params.get(key, [""])[0]
+        return self.query_params.get(key, [default])[0]
 
     def parse_request_body(self):
         """解析请求体"""
@@ -451,9 +770,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 form_data = parse_qs(body.decode())
                 for k, v in form_data.items():
                     self._json_body[k] = v[0] if v else ""
-            elif "multipart/form-data" in content_type:
-                # 简单处理multipart
-                pass
+
+    def do_OPTIONS(self):
+        """CORS 预检"""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def do_GET(self):
         self.parse_request_body()
@@ -476,7 +800,7 @@ class APIHandler(BaseHTTPRequestHandler):
         bot_id = parts[1]
         action = parts[2]
 
-        # 验证token
+        # 验证 token
         token = ""
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -496,87 +820,210 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json(401, {"code": 401, "error": "Unauthorized"})
             return
 
-        # 处理不同action
+        # 处理不同 action
         if action == "messages":
-            text = self.get_param("text")
-            if not text:
-                self.send_json(400, {"code": 400, "error": "Missing text"})
-                return
-
-            if not user.ilink_user_id or not user.context_token:
-                self.send_json(400, {"code": 400, "error": "Context not ready"})
-                return
-
-            if send_message(user, user.ilink_user_id, text, user.context_token):
-                self.send_json(200, {"code": 200, "message": "OK"})
-            else:
-                self.send_json(500, {"code": 500, "error": "Send failed"})
-
+            self._handle_messages(user)
         elif action == "images":
-            # 发送图片消息
-            image_url = self.get_param("image_url")
-            image_base64 = self.get_param("image_base64")
-            
-            if not image_url and not image_base64:
-                self.send_json(400, {"code": 400, "error": "Missing image_url or image_base64"})
-                return
+            self._handle_images(user)
+        elif action == "files":
+            self._handle_files(user)
+        elif action == "videos":
+            self._handle_videos(user)
+        elif action == "upload":
+            self._handle_upload(user)
+        elif action == "typing":
+            self._handle_typing(user)
+        else:
+            self.send_json(404, {"code": 404, "error": "Unknown action"})
 
-            if not user.ilink_user_id or not user.context_token:
-                self.send_json(400, {"code": 400, "error": "Context not ready"})
-                return
+    def _handle_messages(self, user: UserConfig):
+        """处理文本消息"""
+        text = self.get_param("text")
+        to = self.get_param("to", user.ilink_user_id)
+        
+        if not text:
+            self.send_json(400, {"code": 400, "error": "Missing text"})
+            return
 
-            # 如果传的是base64，先上传
-            if image_base64 and not image_url:
-                try:
-                    import base64 as b64
-                    image_data = b64.b64decode(image_base64)
-                    image_url = upload_image(user, image_data)
-                    if not image_url:
-                        self.send_json(500, {"code": 500, "error": "Image upload failed"})
-                        return
-                except Exception as e:
-                    self.send_json(400, {"code": 400, "error": f"Invalid base64: {e}"})
+        if not to:
+            self.send_json(400, {"code": 400, "error": "Missing to (recipient) and no context"})
+            return
+
+        if send_text_message(user, to, text, user.context_token):
+            self.send_json(200, {"code": 200, "message": "OK"})
+        else:
+            self.send_json(500, {"code": 500, "error": "Send failed"})
+
+    def _handle_images(self, user: UserConfig):
+        """处理图片消息"""
+        image_url = self.get_param("image_url")
+        image_base64 = self.get_param("image_base64")
+        to = self.get_param("to", user.ilink_user_id)
+        
+        if not image_url and not image_base64:
+            self.send_json(400, {"code": 400, "error": "Missing image_url or image_base64"})
+            return
+
+        if not to:
+            self.send_json(400, {"code": 400, "error": "Missing to (recipient)"})
+            return
+
+        try:
+            # 获取图片数据
+            if image_url:
+                print(f"下载图片: {image_url[:80]}...")
+                resp = requests.get(image_url, timeout=30)
+                if resp.status_code != 200:
+                    self.send_json(400, {"code": 400, "error": f"Failed to download image: {resp.status_code}"})
                     return
+                image_data = resp.content
+            else:
+                image_data = base64.b64decode(image_base64)
 
-            if send_image(user, user.ilink_user_id, image_url, user.context_token):
-                self.send_json(200, {"code": 200, "message": "OK", "image_url": image_url})
+            # 上传到 CDN
+            upload_info = upload_file_to_cdn(user, image_data, media_type=2, filename="image.jpg")
+            if not upload_info:
+                self.send_json(500, {"code": 500, "error": "CDN upload failed"})
+                return
+
+            # 发送图片消息
+            if send_image_message(user, to, upload_info, user.context_token):
+                self.send_json(200, {"code": 200, "message": "OK"})
             else:
                 self.send_json(500, {"code": 500, "error": "Send image failed"})
 
-        elif action == "upload":
-            # 仅上传图片，返回URL
-            image_base64 = self.get_param("image_base64")
-            if not image_base64:
-                self.send_json(400, {"code": 400, "error": "Missing image_base64"})
+        except Exception as e:
+            self.send_json(500, {"code": 500, "error": str(e)})
+
+    def _handle_files(self, user: UserConfig):
+        """处理文件消息"""
+        file_url = self.get_param("file_url")
+        file_base64 = self.get_param("file_base64")
+        filename = self.get_param("filename", "file")
+        to = self.get_param("to", user.ilink_user_id)
+        
+        if not file_url and not file_base64:
+            self.send_json(400, {"code": 400, "error": "Missing file_url or file_base64"})
+            return
+
+        if not to:
+            self.send_json(400, {"code": 400, "error": "Missing to (recipient)"})
+            return
+
+        try:
+            # 获取文件数据
+            if file_url:
+                print(f"下载文件: {file_url[:80]}...")
+                resp = requests.get(file_url, timeout=60)
+                if resp.status_code != 200:
+                    self.send_json(400, {"code": 400, "error": f"Failed to download file: {resp.status_code}"})
+                    return
+                file_data = resp.content
+            else:
+                file_data = base64.b64decode(file_base64)
+
+            # 上传到 CDN
+            upload_info = upload_file_to_cdn(user, file_data, media_type=5, filename=filename)
+            if not upload_info:
+                self.send_json(500, {"code": 500, "error": "CDN upload failed"})
                 return
 
-            try:
-                import base64 as b64
-                image_data = b64.b64decode(image_base64)
-                image_url = upload_image(user, image_data)
-                if image_url:
-                    self.send_json(200, {"code": 200, "image_url": image_url})
-                else:
-                    self.send_json(500, {"code": 500, "error": "Upload failed"})
-            except Exception as e:
-                self.send_json(400, {"code": 400, "error": f"Invalid base64: {e}"})
-
-        elif action == "typing":
-            status_str = self.get_param("status")
-            status = int(status_str) if status_str else 1
-            if send_typing(user, status):
+            # 发送文件消息
+            if send_file_message(user, to, upload_info, filename, user.context_token):
                 self.send_json(200, {"code": 200, "message": "OK"})
             else:
-                self.send_json(500, {"code": 500, "error": "Send typing failed"})
+                self.send_json(500, {"code": 500, "error": "Send file failed"})
 
+        except Exception as e:
+            self.send_json(500, {"code": 500, "error": str(e)})
+
+    def _handle_videos(self, user: UserConfig):
+        """处理视频消息"""
+        video_url = self.get_param("video_url")
+        video_base64 = self.get_param("video_base64")
+        to = self.get_param("to", user.ilink_user_id)
+        
+        if not video_url and not video_base64:
+            self.send_json(400, {"code": 400, "error": "Missing video_url or video_base64"})
+            return
+
+        if not to:
+            self.send_json(400, {"code": 400, "error": "Missing to (recipient)"})
+            return
+
+        try:
+            # 获取视频数据
+            if video_url:
+                print(f"下载视频: {video_url[:80]}...")
+                resp = requests.get(video_url, timeout=120)
+                if resp.status_code != 200:
+                    self.send_json(400, {"code": 400, "error": f"Failed to download video: {resp.status_code}"})
+                    return
+                video_data = resp.content
+            else:
+                video_data = base64.b64decode(video_base64)
+
+            # 上传到 CDN
+            upload_info = upload_file_to_cdn(user, video_data, media_type=4, filename="video.mp4")
+            if not upload_info:
+                self.send_json(500, {"code": 500, "error": "CDN upload failed"})
+                return
+
+            # 发送视频消息
+            if send_video_message(user, to, upload_info, user.context_token):
+                self.send_json(200, {"code": 200, "message": "OK"})
+            else:
+                self.send_json(500, {"code": 500, "error": "Send video failed"})
+
+        except Exception as e:
+            self.send_json(500, {"code": 500, "error": str(e)})
+
+    def _handle_upload(self, user: UserConfig):
+        """仅上传文件到 CDN"""
+        file_base64 = self.get_param("file_base64")
+        media_type = int(self.get_param("media_type", "2"))  # 默认图片
+        filename = self.get_param("filename", "file")
+        
+        if not file_base64:
+            self.send_json(400, {"code": 400, "error": "Missing file_base64"})
+            return
+
+        try:
+            file_data = base64.b64decode(file_base64)
+            upload_info = upload_file_to_cdn(user, file_data, media_type=media_type, filename=filename)
+            if upload_info:
+                self.send_json(200, {
+                    "code": 200,
+                    "message": "OK",
+                    "aeskey": upload_info["aeskey"],
+                    "aes_key": upload_info["aes_key"],
+                    "encrypt_query_param": upload_info["encrypt_query_param"],
+                    "filesize": upload_info["filesize"],
+                    "rawsize": upload_info["rawsize"]
+                })
+            else:
+                self.send_json(500, {"code": 500, "error": "Upload failed"})
+        except Exception as e:
+            self.send_json(400, {"code": 400, "error": str(e)})
+
+    def _handle_typing(self, user: UserConfig):
+        """处理输入状态"""
+        status_str = self.get_param("status", "1")
+        try:
+            status = int(status_str)
+        except:
+            status = 1
+        
+        if send_typing(user, status):
+            self.send_json(200, {"code": 200, "message": "OK"})
         else:
-            self.send_json(404, {"code": 404, "error": "Unknown action"})
+            self.send_json(500, {"code": 500, "error": "Send typing failed"})
 
 
 def start_api_server(port: int):
     """启动API服务器"""
     server = HTTPServer(("0.0.0.0", port), APIHandler)
-    print(f"API服务启动: http://0.0.0.0:{port}")
+    print(f"API 服务启动: http://0.0.0.0:{port}")
     server.serve_forever()
 
 
@@ -593,7 +1040,7 @@ def console_loop():
     while True:
         try:
             if cfg.active_user:
-                prompt = f"[{cfg.active_user}] > "
+                prompt = f"[{cfg.active_user[:20]}...] > "
             else:
                 prompt = "[未选择账号] > "
 
@@ -616,7 +1063,8 @@ def console_loop():
                 bots_list = list(cfg.bots.items())
                 for i, (bot_id, user) in enumerate(bots_list, 1):
                     mark = "*" if bot_id == cfg.active_user else " "
-                    print(f"  {i}) [{mark}] BotID: {bot_id}  |  APIToken: {user.api_token}")
+                    print(f"  {i}) [{mark}] BotID: {bot_id}")
+                    print(f"       APIToken: {user.api_token}")
                 cfg.lock.release()
 
                 try:
@@ -680,7 +1128,7 @@ def console_loop():
                 print("当前账号没有消息上下文，请先收到一条消息")
                 continue
 
-            if send_message(user, user.ilink_user_id, text, user.context_token):
+            if send_text_message(user, user.ilink_user_id, text, user.context_token):
                 print("发送成功!")
             else:
                 print("发送失败")
@@ -698,10 +1146,10 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="API服务端口")
     args = parser.parse_args()
 
-    print("=" * 50)
-    print("WeClawBot-API Python版本")
+    print("=" * 60)
+    print("WeClawBot-API Python版本 v1.1.0")
     print("基于微信ClawBot (iLink) 的消息推送服务")
-    print("=" * 50)
+    print("=" * 60)
 
     # 加载配置
     cfg.load()
@@ -711,12 +1159,11 @@ def main():
         do_qr_login()
     else:
         print(f"\n已加载 {len(cfg.bots)} 个账号")
-        # 如果只有一个账号，自动选中
         if len(cfg.bots) == 1:
             cfg.active_user = list(cfg.bots.keys())[0]
             print(f"自动选中: {cfg.active_user}")
 
-    # 为缺少api_token的账号补充token
+    # 为缺少 api_token 的账号补充 token
     cfg.lock.acquire()
     for user in cfg.bots.values():
         if not user.api_token:
@@ -737,7 +1184,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 启动API服务器
+    # 启动 API 服务器
     api_thread = threading.Thread(target=start_api_server, args=(args.port,), daemon=True)
     api_thread.start()
 

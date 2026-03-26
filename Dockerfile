@@ -11,9 +11,10 @@ COPY main.py .
 
 # 创建配置目录
 RUN mkdir -p /app/config
+VOLUME /app/config
 
 # 暴露端口
 EXPOSE 26322
 
-# 启动
+# 启动服务
 CMD ["python", "main.py"]
